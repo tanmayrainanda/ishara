@@ -16,6 +16,7 @@ with open('/Users/tanmay/Downloads/weights/cfg_2/fold-1/inference_args.json') as
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+
 # Initialize MediaPipe hands and drawing
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -23,6 +24,34 @@ hands = mp_hands.Hands()
 
 # Capture from webcam
 cap = cv2.VideoCapture(0)
+
+def test_model_with_landmarks(landmark_input):
+    input_data = np.array(landmark_input).flatten().astype(np.float32)
+    expected_features = inference_args.get('input_shape', [1, 390])[1]
+
+    # Adjust landmarks
+    if input_data.size < expected_features:
+        input_data = np.concatenate([input_data, np.zeros(expected_features - input_data.size)], axis=0)
+    else:
+        input_data = input_data[:expected_features]
+
+    input_data = input_data.reshape(1, expected_features).astype(np.float32)
+
+    # Set the tensor
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+
+    # Run inference
+    interpreter.invoke()
+
+    # Get output
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+    probabilities = output_data[0]  # Assuming output is (1, num_classes)
+    
+    # Get top 3 predictions
+    top_3_indices = np.argsort(probabilities)[-3:][::-1]
+    top_3_probs = probabilities[top_3_indices]
+
+    return list(zip(top_3_indices, top_3_probs))
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -41,32 +70,14 @@ while cap.isOpened():
             landmarks = []
             for landmark in hand_landmarks.landmark:
                 landmarks.append([landmark.x, landmark.y, landmark.z])
-            
-            # Convert to numpy array
-            landmarks_array = np.array(landmarks).flatten().astype(np.float32)
-            expected_features = inference_args.get('input_shape', [1, 390])[1]
 
-            # Adjust landmarks
-            if landmarks_array.size < expected_features:
-                input_data = np.concatenate([landmarks_array, np.zeros(expected_features - landmarks_array.size)], axis=0)
-            else:
-                input_data = landmarks_array[:expected_features]
+            # Predict using webcam input
+            top_predictions = test_model_with_landmarks(landmarks)
 
-            # Ensure the final input is FLOAT32 and reshape for model input
-            input_data = input_data.astype(np.float32).reshape(1, expected_features)
-
-            # Set the tensor
-            interpreter.set_tensor(input_details[0]['index'], input_data)
-
-            # Run inference
-            interpreter.invoke()
-
-            # Get output
-            output_data = interpreter.get_tensor(output_details[0]['index'])
-            predicted_class = np.argmax(output_data)
-
-            # Display prediction
-            cv2.putText(frame, f'Predicted: {predicted_class}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            # Display top 3 predictions
+            for i, (pred_index, prob) in enumerate(top_predictions):
+                cv2.putText(frame, f'Pred {i+1}: Class {pred_index} ({prob:.2f})', 
+                            (10, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
     cv2.imshow('ASL Recognition', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
