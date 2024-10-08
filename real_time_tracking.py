@@ -27,7 +27,7 @@ cap = cv2.VideoCapture(0)
 
 def test_model_with_landmarks(landmark_input):
     input_data = np.array(landmark_input).flatten().astype(np.float32)
-    expected_features = inference_args.get('input_shape', [1, 390])[1]
+    expected_features = inference_args.get('input_shape', [1, 390])[1]  # Adjust based on your model
 
     # Adjust landmarks
     if input_data.size < expected_features:
@@ -46,12 +46,13 @@ def test_model_with_landmarks(landmark_input):
     # Get output
     output_data = interpreter.get_tensor(output_details[0]['index'])
     probabilities = output_data[0]  # Assuming output is (1, num_classes)
-    
+
     # Get top 3 predictions
     top_3_indices = np.argsort(probabilities)[-3:][::-1]
     top_3_probs = probabilities[top_3_indices]
 
     return list(zip(top_3_indices, top_3_probs))
+
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -63,10 +64,8 @@ while cap.isOpened():
 
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            # Draw the hand landmarks on the frame
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-            # Prepare landmarks for model input
             landmarks = []
             for landmark in hand_landmarks.landmark:
                 landmarks.append([landmark.x, landmark.y, landmark.z])
@@ -74,7 +73,11 @@ while cap.isOpened():
             # Predict using webcam input
             top_predictions = test_model_with_landmarks(landmarks)
 
-            # Display top 3 predictions
+            # Log the input and predictions for debugging
+            print("Input Landmarks:", landmarks)
+            print("Top Predictions:", top_predictions)
+
+            # Display top predictions
             for i, (pred_index, prob) in enumerate(top_predictions):
                 cv2.putText(frame, f'Pred {i+1}: Class {pred_index} ({prob:.2f})', 
                             (10, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
@@ -82,6 +85,7 @@ while cap.isOpened():
     cv2.imshow('ASL Recognition', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+
 
 cap.release()
 cv2.destroyAllWindows()
