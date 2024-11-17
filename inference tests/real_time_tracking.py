@@ -75,12 +75,12 @@ while cap.isOpened():
 
             # Log the input and predictions for debugging
             print("Input Landmarks:", landmarks)
-            print("Top Predictions:", top_predictions)
+            #print("Top Predictions:", top_predictions)
 
             # Display top predictions
-            for i, (pred_index, prob) in enumerate(top_predictions):
+            """ for i, (pred_index, prob) in enumerate(top_predictions):
                 cv2.putText(frame, f'Pred {i+1}: Class {pred_index} ({prob:.2f})', 
-                            (10, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                            (10, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2) """
 
     cv2.imshow('ASL Recognition', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
