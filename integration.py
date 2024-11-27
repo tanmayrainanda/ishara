@@ -426,26 +426,104 @@ class ASLDataset(Dataset):
         
     def __len__(self) -> int:
         return len(self.df)
-    
-    def get_landmarks(self, sequence_id: str) -> np.ndarray:
-        """Load landmarks for a specific sequence from parquet file"""
-        parquet_file = self.sequence_to_file[sequence_id]
         
-        # Read the specific sequence from parquet file
-        table = pq.read_table(
-            parquet_file,
-            filters=[('sequence_id', '=', sequence_id)]
-        )
-        df = table.to_pandas()
+    def augment_landmarks(self, landmarks: torch.Tensor) -> torch.Tensor:
+        """Apply augmentations to landmark sequence"""
+        # Time augmentations
+        if random.random() < 0.8:
+            # Random resize along time axis
+            scale = random.uniform(0.8, 1.2)
+            T = landmarks.shape[0]
+            new_T = int(T * scale)
+            
+            # Reshape to [1, C, T, N] for interpolation
+            landmarks_reshaped = landmarks.permute(2, 0, 1).unsqueeze(0)  # [1, 3, T, N]
+            
+            # Interpolate each channel separately
+            landmarks_resized = []
+            for c in range(landmarks_reshaped.shape[1]):
+                channel = landmarks_reshaped[:, c:c+1]  # [1, 1, T, N]
+                resized = F.interpolate(
+                    channel,
+                    size=(new_T, landmarks.shape[1]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                landmarks_resized.append(resized)
+                
+            # Combine channels back
+            landmarks = torch.cat(landmarks_resized, dim=1).squeeze(0).permute(1, 2, 0)
+            
+        if random.random() < 0.5:
+            # Random time shift
+            shift = random.randint(-10, 10)
+            landmarks = torch.roll(landmarks, shift, dims=0)
+            
+        # Spatial augmentations
+        if random.random() < 0.8:
+            # Random spatial affine
+            angle = random.uniform(-30, 30)
+            scale = random.uniform(0.8, 1.2)
+            shear = random.uniform(-0.2, 0.2)
+            translate = (random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1))
+            
+            theta = torch.tensor([
+                [scale * math.cos(angle), -scale * math.sin(angle) + shear, translate[0]],
+                [scale * math.sin(angle) + shear, scale * math.cos(angle), translate[1]]
+            ]).float()[None]  # Add batch dimension
+            
+            # Handle each frame separately
+            landmarks_2d = landmarks[..., :2]  # Only x,y coordinates
+            T = landmarks_2d.shape[0]
+            
+            # Process each frame
+            transformed_frames = []
+            for t in range(T):
+                frame = landmarks_2d[t:t+1]  # Add batch dimension
+                
+                grid = F.affine_grid(
+                    theta,
+                    size=(1, 1, frame.shape[1], 2),
+                    align_corners=False
+                )
+                
+                transformed = F.grid_sample(
+                    frame[:, None],  # Add channel dimension
+                    grid,
+                    align_corners=False
+                )
+                transformed_frames.append(transformed[:, 0])  # Remove channel dimension
+            
+            # Stack frames back together
+            landmarks_2d = torch.cat(transformed_frames, dim=0)
+            landmarks[..., :2] = landmarks_2d
         
-        # Extract landmark columns (excluding sequence_id and frame)
-        landmark_cols = [col for col in df.columns if col not in ['sequence_id', 'frame']]
-        landmarks = df[landmark_cols].values
-        
-        # Reshape landmarks to (frames, landmarks, 3)
-        num_landmarks = len(landmark_cols) // 3
-        landmarks = landmarks.reshape(-1, num_landmarks, 3)
-        
+        # Landmark dropping
+        if random.random() < 0.5:
+            # Randomly drop fingers
+            num_fingers = random.randint(2, 6)
+            num_windows = random.randint(2, 3)
+            
+            for _ in range(num_windows):
+                window_start = random.randint(0, landmarks.shape[0] - 20)
+                window_size = random.randint(10, 20)
+                window_end = min(window_start + window_size, landmarks.shape[0])
+                
+                for _ in range(num_fingers):
+                    finger_start = random.randint(88, 130 - 4)  # Hand landmarks
+                    landmarks[window_start:window_end, finger_start:finger_start+4] = 0
+                    
+        if random.random() < 0.5:
+            # Drop face or pose landmarks
+            if random.random() < 0.5:
+                landmarks[:, :76] = 0  # Face
+            else:
+                landmarks[:, 76:88] = 0  # Pose
+                
+        if random.random() < 0.05:
+            # Drop all hand landmarks
+            landmarks[:, 88:] = 0
+            
         return landmarks
     
     def normalize_landmarks(self, landmarks: np.ndarray) -> torch.Tensor:
@@ -480,12 +558,18 @@ class ASLDataset(Dataset):
         T = landmarks.shape[0]
         if T > self.max_len:
             # Resize if too long
-            landmarks = F.interpolate(
-                landmarks.permute(2, 0, 1)[None],
-                size=self.max_len,
-                mode='linear',
-                align_corners=False
-            )[0].permute(1, 2, 0)
+            # Process each channel separately
+            resized_landmarks = []
+            for c in range(landmarks.shape[2]):
+                channel = landmarks[..., c:c+1]  # [T, N, 1]
+                resized = F.interpolate(
+                    channel.transpose(0, 1).unsqueeze(0),  # [1, N, T, 1]
+                    size=self.max_len,
+                    mode='linear',
+                    align_corners=False
+                )  # [1, N, max_len, 1]
+                resized_landmarks.append(resized.squeeze(0).transpose(0, 1).squeeze(-1))  # [max_len, N]
+            landmarks = torch.stack(resized_landmarks, dim=-1)  # [max_len, N, 3]
         else:
             # Pad if too short
             pad_len = self.max_len - T
@@ -500,6 +584,27 @@ class ASLDataset(Dataset):
             'phrase': row['phrase'],
             'length': torch.tensor(T)
         }
+
+        def get_landmarks(self, sequence_id: str) -> np.ndarray:
+            """Load landmarks for a specific sequence from parquet file"""
+            parquet_file = self.sequence_to_file[sequence_id]
+            
+            # Read the specific sequence from parquet file
+            table = pq.read_table(
+                parquet_file,
+                filters=[('sequence_id', '=', sequence_id)]
+            )
+            df = table.to_pandas()
+            
+            # Extract landmark columns (excluding sequence_id and frame)
+            landmark_cols = [col for col in df.columns if col not in ['sequence_id', 'frame']]
+            landmarks = df[landmark_cols].values
+            
+            # Reshape landmarks to (frames, landmarks, 3)
+            num_landmarks = len(landmark_cols) // 3
+            landmarks = landmarks.reshape(-1, num_landmarks, 3)
+            
+            return landmarks
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Custom collate function for batching"""
