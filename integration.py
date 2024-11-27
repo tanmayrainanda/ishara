@@ -19,17 +19,32 @@ import pyarrow.parquet as pq
 class FeatureExtractor(nn.Module):
     def __init__(self, input_channels: int = 3, output_dim: int = 52):
         super().__init__()
-        self.conv = nn.Conv2d(input_channels, 64, kernel_size=3, padding=1)
-        self.bn = nn.BatchNorm2d(64)
-        self.flatten = nn.Flatten(start_dim=2)
-        self.linear = nn.Linear(64 * input_channels, output_dim)
+        self.conv = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
+        self.bn = nn.BatchNorm1d(64)
+        self.linear = nn.Linear(64, output_dim)
 
     def forward(self, x):
-        x = self.conv(x)
+        # x shape: [batch, time, landmarks, channels]
+        B, T, L, C = x.shape
+        
+        # Reshape for 1D convolution over landmarks
+        x = x.permute(0, 1, 3, 2)  # [batch, time, channels, landmarks]
+        x = x.reshape(B * T, C, L)  # [batch*time, channels, landmarks]
+        
+        # Apply convolution
+        x = self.conv(x)  # [batch*time, 64, landmarks]
         x = self.bn(x)
         x = F.relu(x)
-        x = self.flatten(x)
-        x = self.linear(x)
+        
+        # Global average pooling over landmarks
+        x = x.mean(dim=2)  # [batch*time, 64]
+        
+        # Project to output dimension
+        x = self.linear(x)  # [batch*time, output_dim]
+        
+        # Reshape back to sequence
+        x = x.reshape(B, T, -1)  # [batch, time, output_dim]
+        
         return x
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -238,7 +253,6 @@ class ASLTranslationModel(nn.Module):
         self.pose_extractor = FeatureExtractor(3, 52)
         self.left_hand_extractor = FeatureExtractor(3, 52)
         self.right_hand_extractor = FeatureExtractor(3, 52)
-        self.all_landmarks_extractor = FeatureExtractor(3, 208)
         
         # Positional embedding
         self.rotary_pe = RotaryPositionalEmbedding(feature_dim)
@@ -288,17 +302,11 @@ class ASLTranslationModel(nn.Module):
         left_hand_feats = self.left_hand_extractor(left_hand)
         right_hand_feats = self.right_hand_extractor(right_hand)
         
-        # Concatenate all type-specific features
-        type_feats = torch.cat(
+        # Concatenate all features
+        features = torch.cat(
             [face_feats, pose_feats, left_hand_feats, right_hand_feats],
             dim=-1
-        )
-        
-        # Get features for all landmarks together
-        all_feats = self.all_landmarks_extractor(x)
-        
-        # Combine both feature sets
-        features = torch.cat([all_feats, type_feats], dim=-1)
+        )  # [batch, time, feature_dim]
         
         # Get rotary embeddings
         sin, cos = self.rotary_pe(features)
@@ -426,39 +434,47 @@ class ASLDataset(Dataset):
         
     def __len__(self) -> int:
         return len(self.df)
+
+    def get_landmarks(self, sequence_id: str) -> np.ndarray:
+        """Load landmarks for a specific sequence from parquet file"""
+        parquet_file = self.sequence_to_file[sequence_id]
+        
+        # Read the specific sequence from parquet file
+        table = pq.read_table(
+            parquet_file,
+            filters=[('sequence_id', '=', sequence_id)]
+        )
+        df = table.to_pandas()
+        
+        # Extract landmark columns (excluding sequence_id and frame)
+        landmark_cols = [col for col in df.columns if col not in ['sequence_id', 'frame']]
+        landmarks = df[landmark_cols].values
+        
+        # Reshape landmarks to (frames, landmarks, 3)
+        num_landmarks = len(landmark_cols) // 3
+        landmarks = landmarks.reshape(-1, num_landmarks, 3)
+        
+        return landmarks
         
     def augment_landmarks(self, landmarks: torch.Tensor) -> torch.Tensor:
-        """Apply augmentations to landmark sequence"""
+        """Apply augmentations to landmark sequence with safety checks"""
+        T = landmarks.shape[0]  # sequence length
+        
         # Time augmentations
         if random.random() < 0.8:
             # Random resize along time axis
             scale = random.uniform(0.8, 1.2)
-            T = landmarks.shape[0]
             new_T = int(T * scale)
-            
-            # Reshape to [1, C, T, N] for interpolation
-            landmarks_reshaped = landmarks.permute(2, 0, 1).unsqueeze(0)  # [1, 3, T, N]
-            
-            # Interpolate each channel separately
-            landmarks_resized = []
-            for c in range(landmarks_reshaped.shape[1]):
-                channel = landmarks_reshaped[:, c:c+1]  # [1, 1, T, N]
-                resized = F.interpolate(
-                    channel,
-                    size=(new_T, landmarks.shape[1]),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                landmarks_resized.append(resized)
-                
-            # Combine channels back
-            landmarks = torch.cat(landmarks_resized, dim=1).squeeze(0).permute(1, 2, 0)
-            
-        if random.random() < 0.5:
+            if new_T > 0:  # Only resize if new length is valid
+                indices = torch.linspace(0, T-1, new_T).long()
+                landmarks = landmarks[indices]
+                T = new_T  # Update sequence length
+        
+        if random.random() < 0.5 and T > 1:
             # Random time shift
-            shift = random.randint(-10, 10)
+            shift = random.randint(-min(5, T//2), min(5, T//2))
             landmarks = torch.roll(landmarks, shift, dims=0)
-            
+        
         # Spatial augmentations
         if random.random() < 0.8:
             # Random spatial affine
@@ -474,7 +490,6 @@ class ASLDataset(Dataset):
             
             # Handle each frame separately
             landmarks_2d = landmarks[..., :2]  # Only x,y coordinates
-            T = landmarks_2d.shape[0]
             
             # Process each frame
             transformed_frames = []
@@ -499,31 +514,34 @@ class ASLDataset(Dataset):
             landmarks[..., :2] = landmarks_2d
         
         # Landmark dropping
-        if random.random() < 0.5:
+        if random.random() < 0.5 and T >= 20:  # Only apply to sequences long enough
             # Randomly drop fingers
-            num_fingers = random.randint(2, 6)
-            num_windows = random.randint(2, 3)
+            num_fingers = random.randint(1, 3)  # Reduced from 2-6 to 1-3
+            num_windows = random.randint(1, 2)  # Reduced from 2-3 to 1-2
             
             for _ in range(num_windows):
-                window_start = random.randint(0, landmarks.shape[0] - 20)
-                window_size = random.randint(10, 20)
-                window_end = min(window_start + window_size, landmarks.shape[0])
+                if T <= 20:  # Skip if sequence too short
+                    break
+                
+                window_size = min(random.randint(5, 10), T-1)  # Reduced window size
+                window_start = random.randint(0, T - window_size)
+                window_end = window_start + window_size
                 
                 for _ in range(num_fingers):
-                    finger_start = random.randint(88, 130 - 4)  # Hand landmarks
+                    finger_start = random.randint(88, 126)  # Adjusted range
                     landmarks[window_start:window_end, finger_start:finger_start+4] = 0
-                    
-        if random.random() < 0.5:
+        
+        if random.random() < 0.3:  # Reduced probability from 0.5
             # Drop face or pose landmarks
             if random.random() < 0.5:
                 landmarks[:, :76] = 0  # Face
             else:
                 landmarks[:, 76:88] = 0  # Pose
-                
-        if random.random() < 0.05:
+        
+        if random.random() < 0.05:  # Keep rare complete hand dropping
             # Drop all hand landmarks
             landmarks[:, 88:] = 0
-            
+        
         return landmarks
     
     def normalize_landmarks(self, landmarks: np.ndarray) -> torch.Tensor:
@@ -557,19 +575,9 @@ class ASLDataset(Dataset):
         # Pad or resize sequence to max_len
         T = landmarks.shape[0]
         if T > self.max_len:
-            # Resize if too long
-            # Process each channel separately
-            resized_landmarks = []
-            for c in range(landmarks.shape[2]):
-                channel = landmarks[..., c:c+1]  # [T, N, 1]
-                resized = F.interpolate(
-                    channel.transpose(0, 1).unsqueeze(0),  # [1, N, T, 1]
-                    size=self.max_len,
-                    mode='linear',
-                    align_corners=False
-                )  # [1, N, max_len, 1]
-                resized_landmarks.append(resized.squeeze(0).transpose(0, 1).squeeze(-1))  # [max_len, N]
-            landmarks = torch.stack(resized_landmarks, dim=-1)  # [max_len, N, 3]
+            # Resize if too long using linear interpolation
+            indices = torch.linspace(0, T-1, self.max_len).long()
+            landmarks = landmarks[indices]
         else:
             # Pad if too short
             pad_len = self.max_len - T
@@ -584,27 +592,6 @@ class ASLDataset(Dataset):
             'phrase': row['phrase'],
             'length': torch.tensor(T)
         }
-
-        def get_landmarks(self, sequence_id: str) -> np.ndarray:
-            """Load landmarks for a specific sequence from parquet file"""
-            parquet_file = self.sequence_to_file[sequence_id]
-            
-            # Read the specific sequence from parquet file
-            table = pq.read_table(
-                parquet_file,
-                filters=[('sequence_id', '=', sequence_id)]
-            )
-            df = table.to_pandas()
-            
-            # Extract landmark columns (excluding sequence_id and frame)
-            landmark_cols = [col for col in df.columns if col not in ['sequence_id', 'frame']]
-            landmarks = df[landmark_cols].values
-            
-            # Reshape landmarks to (frames, landmarks, 3)
-            num_landmarks = len(landmark_cols) // 3
-            landmarks = landmarks.reshape(-1, num_landmarks, 3)
-            
-            return landmarks
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Custom collate function for batching"""
@@ -719,9 +706,10 @@ class Trainer:
             tokens = batch['tokens'].to(self.device)
             lengths = batch['length'].to(self.device)
             
-            # Create mask based on sequence lengths
-            mask = torch.arange(landmarks.size(1))[None, :] < lengths[:, None]
-            mask = mask.to(self.device)
+            # Create mask based on sequence lengths - ensure arange is on same device
+            seq_length = landmarks.size(1)
+            position_indices = torch.arange(seq_length, device=self.device)[None, :]
+            mask = position_indices < lengths[:, None]
             
             # Forward pass with mixed precision
             with autocast():
@@ -731,11 +719,11 @@ class Trainer:
                 with torch.no_grad():
                     confidence_target = torch.tensor([
                         1 - Levenshtein.distance(
-                            self.tokenizer.decode(p.argmax(-1)),
+                            self.tokenizer.decode(p.argmax(-1).cpu()),
                             true_text
                         ) / max(len(true_text), 1)
                         for p, true_text in zip(pred, batch['phrase'])
-                    ]).to(self.device)
+                    ], device=self.device)
                 
                 # Calculate loss
                 loss = self.criterion(pred, tokens[:, 1:], confidence, confidence_target)
@@ -867,7 +855,7 @@ def main():
         'learning_rate': 0.0045,
         'weight_decay': 0.08,
         'warmup_epochs': 10,
-        'max_epochs': 400,
+        'max_epochs': 150,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'wandb_project': 'asl-translation',
         'wandb_entity': None,
