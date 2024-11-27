@@ -585,3 +585,290 @@ class ASLTranslationLoss(nn.Module):
         
         # Combine losses
         return seq_loss + 0.1 * conf_loss
+    
+class Trainer:
+    """Training controller for ASL Translation model"""
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        tokenizer: ASLTokenizer,
+        learning_rate: float = 0.0045,
+        weight_decay: float = 0.08,
+        warmup_epochs: int = 10,
+        max_epochs: int = 400,
+        device: str = 'cuda'
+    ):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.tokenizer = tokenizer
+        self.device = device
+        
+        # Optimizer
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        
+        # Learning rate scheduler
+        self.num_training_steps = len(train_loader) * max_epochs
+        self.num_warmup_steps = len(train_loader) * warmup_epochs
+        self.scheduler = self.get_scheduler()
+        
+        # Loss function
+        self.criterion = ASLTranslationLoss()
+        
+        # Gradient scaler for mixed precision training
+        self.scaler = GradScaler()
+        
+        # Best validation score
+        self.best_score = float('-inf')
+        
+    def get_scheduler(self):
+        """Create cosine learning rate scheduler with warmup"""
+        return torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.optimizer.param_groups[0]['lr'],
+            total_steps=self.num_training_steps,
+            pct_start=self.num_warmup_steps / self.num_training_steps,
+            anneal_strategy='cos',
+            cycle_momentum=False
+        )
+    
+    def train_epoch(self) -> float:
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        
+        for batch in tqdm(self.train_loader, desc='Training'):
+            self.optimizer.zero_grad()
+            
+            # Move batch to device
+            landmarks = batch['landmarks'].to(self.device)
+            tokens = batch['tokens'].to(self.device)
+            lengths = batch['length'].to(self.device)
+            
+            # Create mask based on sequence lengths
+            mask = torch.arange(landmarks.size(1))[None, :] < lengths[:, None]
+            mask = mask.to(self.device)
+            
+            # Forward pass with mixed precision
+            with autocast():
+                pred, confidence = self.model(landmarks, mask, tokens[:, :-1])
+                
+                # Calculate normalized Levenshtein distance for confidence target
+                with torch.no_grad():
+                    confidence_target = torch.tensor([
+                        1 - Levenshtein.distance(
+                            self.tokenizer.decode(p.argmax(-1)),
+                            true_text
+                        ) / max(len(true_text), 1)
+                        for p, true_text in zip(pred, batch['phrase'])
+                    ]).to(self.device)
+                
+                # Calculate loss
+                loss = self.criterion(pred, tokens[:, 1:], confidence, confidence_target)
+            
+            # Backward pass with gradient scaling
+            self.scaler.scale(loss).backward()
+            
+            # Clip gradients
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            # Optimizer and scheduler step
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.scheduler.step()
+            
+            total_loss += loss.item()
+        
+        return total_loss / len(self.train_loader)
+    
+    @torch.no_grad()
+    def validate(self) -> Tuple[float, float]:
+        """Validate model and compute metrics"""
+        self.model.eval()
+        total_loss = 0
+        predictions = []
+        ground_truth = []
+        
+        for batch in tqdm(self.val_loader, desc='Validating'):
+            # Move batch to device
+            landmarks = batch['landmarks'].to(self.device)
+            tokens = batch['tokens'].to(self.device)
+            lengths = batch['length'].to(self.device)
+            
+            # Create mask based on sequence lengths
+            mask = torch.arange(landmarks.size(1))[None, :] < lengths[:, None]
+            mask = mask.to(self.device)
+            
+            # Forward pass
+            pred, confidence = self.model(landmarks, mask)
+            
+            # Decode predictions
+            pred_texts = [
+                self.tokenizer.decode(p.argmax(-1))
+                for p in pred
+            ]
+            predictions.extend(pred_texts)
+            ground_truth.extend(batch['phrase'])
+            
+            # Calculate loss
+            confidence_target = torch.tensor([
+                1 - Levenshtein.distance(pred_text, true_text) / max(len(true_text), 1)
+                for pred_text, true_text in zip(pred_texts, batch['phrase'])
+            ]).to(self.device)
+            
+            loss = self.criterion(pred, tokens[:, 1:], confidence, confidence_target)
+            total_loss += loss.item()
+        
+        # Calculate metrics
+        avg_loss = total_loss / len(self.val_loader)
+        
+        # Calculate normalized Levenshtein distance
+        distances = [
+            1 - Levenshtein.distance(pred, true) / max(len(pred), len(true))
+            for pred, true in zip(predictions, ground_truth)
+        ]
+        avg_score = sum(distances) / len(distances)
+        
+        return avg_loss, avg_score
+    
+    def train(self, save_dir: str):
+        """Train model for specified number of epochs"""
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for epoch in range(self.num_training_steps // len(self.train_loader)):
+            print(f"\nEpoch {epoch + 1}")
+            
+            # Train
+            train_loss = self.train_epoch()
+            print(f"Training Loss: {train_loss:.4f}")
+            
+            # Validate
+            val_loss, val_score = self.validate()
+            print(f"Validation Loss: {val_loss:.4f}")
+            print(f"Validation Score: {val_score:.4f}")
+            
+            # Save best model
+            if val_score > self.best_score:
+                self.best_score = val_score
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'scheduler_state_dict': self.scheduler.state_dict(),
+                        'best_score': self.best_score,
+                    },
+                    os.path.join(save_dir, 'best_model.pt')
+                )
+                print(f"Saved new best model with score: {val_score:.4f}")
+            
+            # Save checkpoint
+            if (epoch + 1) % 10 == 0:
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'scheduler_state_dict': self.scheduler.state_dict(),
+                        'best_score': self.best_score,
+                    },
+                    os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                )
+
+def main():
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    
+    # Configuration
+    config = {
+        'data_dir': 'path/to/landmark/data',
+        'metadata_path': 'path/to/metadata.csv',
+        'vocab_path': 'path/to/character_to_prediction_index.json',
+        'save_dir': 'path/to/save/models',
+        'batch_size': 32,
+        'max_len': 384,
+        'num_workers': 4,
+        'learning_rate': 0.0045,
+        'weight_decay': 0.08,
+        'warmup_epochs': 10,
+        'max_epochs': 400,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    }
+    
+    # Initialize tokenizer
+    tokenizer = ASLTokenizer(config['vocab_path'])
+    
+    # Create datasets
+    train_dataset = ASLDataset(
+        config['data_dir'],
+        config['metadata_path'],
+        tokenizer,
+        max_len=config['max_len'],
+        augment=True,
+        mode='train'
+    )
+    
+    val_dataset = ASLDataset(
+        config['data_dir'],
+        config['metadata_path'],
+        tokenizer,
+        max_len=config['max_len'],
+        augment=False,
+        mode='val'
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    # Create model
+    model = ASLTranslationModel(
+        num_landmarks=130,
+        feature_dim=208,
+        num_classes=len(tokenizer.char_to_idx),
+        num_layers=7,
+        dropout=0.1
+    )
+    
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        tokenizer=tokenizer,
+        learning_rate=config['learning_rate'],
+        weight_decay=config['weight_decay'],
+        warmup_epochs=config['warmup_epochs'],
+        max_epochs=config['max_epochs'],
+        device=config['device']
+    )
+    
+    # Train model
+    trainer.train(config['save_dir'])
+
+if __name__ == "__main__":
+    main()
