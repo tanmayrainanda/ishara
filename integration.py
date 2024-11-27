@@ -50,16 +50,18 @@ class FeatureExtractor(nn.Module):
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 384):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        position = torch.arange(max_seq_len).float()
-        sinusoid = torch.einsum('i,j->ij', position, inv_freq)
-        self.register_buffer('sin', sinusoid.sin())
-        self.register_buffer('cos', sinusoid.cos())
+        head_dim = dim // 8  # Assuming 8 heads
+        half_head_dim = head_dim // 2
+        emb = math.log(10000) / (half_head_dim - 1)
+        emb = torch.exp(torch.arange(half_head_dim) * -emb)
+        pos = torch.arange(max_seq_len)
+        emb = pos[:, None] * emb[None, :]  # [max_seq_len, half_head_dim]
+        self.register_buffer('sin', emb.sin())
+        self.register_buffer('cos', emb.cos())
 
     def forward(self, x):
-        sin = self.sin[:x.shape[1]]
-        cos = self.cos[:x.shape[1]]
-        return sin, cos
+        seq_len = x.shape[1]
+        return self.sin[:seq_len], self.cos[:seq_len]
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
@@ -67,6 +69,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.dim = dim
         self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
         
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
@@ -74,38 +77,66 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
+    def _rotate_half(self, x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q, k, sin, cos):
+        # sin/cos: [seq_len, head_dim//2]
+        # q, k: [batch, seq_len, num_heads, head_dim]
+        sin = sin.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim//2]
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim//2]
+        
+        # Separate half of head dim for rotation
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+        
+        # Apply rotation using complementary pairs
+        q = torch.cat([
+            q1 * cos - q2 * sin,
+            q2 * cos + q1 * sin,
+        ], dim=-1)
+        
+        k = torch.cat([
+            k1 * cos - k2 * sin,
+            k2 * cos + k1 * sin,
+        ], dim=-1)
+        
+        return q, k
+
     def forward(self, x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor, 
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, D = x.shape
         
+        # Project inputs
         q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim)
         
         # Apply rotary embeddings
-        q_rot, q_pass = q[..., :self.head_dim//2], q[..., self.head_dim//2:]
-        k_rot, k_pass = k[..., :self.head_dim//2], k[..., self.head_dim//2:]
-        
-        # Rotate q and k
-        q = torch.cat([-q_rot * sin[:, None] + q_rot * cos[:, None], q_pass], dim=-1)
-        k = torch.cat([-k_rot * sin[:, None] + k_rot * cos[:, None], k_pass], dim=-1)
+        q, k = self.apply_rotary_pos_emb(q, k, sin, cos)
         
         # Reshape for attention
-        q = q.transpose(1, 2)  # (B, H, L, D/H)
-        k = k.transpose(1, 2)  # (B, H, L, D/H)
-        v = v.transpose(1, 2)  # (B, H, L, D/H)
+        q = q.transpose(1, 2)  # [B, H, L, D/H]
+        k = k.transpose(1, 2)  # [B, H, L, D/H]
+        v = v.transpose(1, 2)  # [B, H, L, D/H]
 
-        # Attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # Calculate attention scores
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            # Expand mask for attention heads
+            mask = mask.unsqueeze(1)  # [B, 1, L]
+            attn = attn.masked_fill(~mask.unsqueeze(2), float('-inf'))
         
-        attn = F.softmax(scores, dim=-1)
+        attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
         
-        out = torch.matmul(attn, v)  # (B, H, L, D/H)
-        out = out.transpose(1, 2).contiguous()  # (B, L, H, D/H)
-        out = out.reshape(B, L, D)  # (B, L, D)
+        # Combine with values
+        out = torch.matmul(attn, v)  # [B, H, L, D/H]
+        out = out.transpose(1, 2).contiguous()  # [B, L, H, D/H]
+        out = out.reshape(B, L, D)  # [B, L, D]
         
         return self.out_proj(out)
 
@@ -118,13 +149,15 @@ class ConformerBlock(nn.Module):
         # Convolution module
         self.conv_module = nn.Sequential(
             nn.LayerNorm(dim),
+            Transpose(1, 2),  # [B, D, T]
             nn.Conv1d(dim, dim*2, 1),
             nn.GLU(dim=1),
             nn.Conv1d(dim, dim, 3, padding=1, groups=dim),
             nn.BatchNorm1d(dim),
             nn.SiLU(),
             nn.Conv1d(dim, dim, 1),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
+            Transpose(1, 2),  # [B, T, D]
         )
         
         # Feed forward module
@@ -153,8 +186,7 @@ class ConformerBlock(nn.Module):
         
         # Convolution module
         residual = x
-        x = self.norm2(x)
-        x = self.conv_module(x.transpose(1, 2)).transpose(1, 2)
+        x = self.conv_module(x)  # Handles its own normalization and transpose
         x = residual + x * self.scale
         
         # Feed forward
@@ -171,7 +203,7 @@ class SqueezeformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.mhsa = MultiHeadAttention(dim, num_heads, dropout)
         
-        # Feed forward module
+        # Feed forward module 1
         self.ff1 = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim*4),
@@ -184,15 +216,18 @@ class SqueezeformerBlock(nn.Module):
         # Convolution module
         self.conv_module = nn.Sequential(
             nn.LayerNorm(dim),
+            Transpose(1, 2),  # [B, D, T]
             nn.Conv1d(dim, dim*2, 1),
             nn.GLU(dim=1),
             nn.Conv1d(dim, dim, 3, padding=1, groups=dim),
             nn.BatchNorm1d(dim),
             nn.SiLU(),
             nn.Conv1d(dim, dim, 1),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
+            Transpose(1, 2),  # [B, T, D]
         )
         
+        # Feed forward module 2
         self.ff2 = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim*4),
@@ -225,8 +260,7 @@ class SqueezeformerBlock(nn.Module):
         
         # Convolution module
         residual = x
-        x = self.norm3(x)
-        x = self.conv_module(x.transpose(1, 2)).transpose(1, 2)
+        x = self.conv_module(x)  # Handles its own normalization and transpose
         x = residual + x * self.scale
         
         # Second feed forward
@@ -236,6 +270,21 @@ class SqueezeformerBlock(nn.Module):
         x = residual + x * self.scale
         
         return x
+
+# Helper class for handling transpose operations
+class Transpose(nn.Module):
+    def __init__(self, dim1, dim2):
+        super().__init__()
+        self.dim1 = dim1
+        self.dim2 = dim2
+
+    def forward(self, x):
+        return x.transpose(self.dim1, self.dim2)
+
+def generate_sequence_mask(batch_size: int, seq_len: int, tgt_len: int, device: str) -> torch.Tensor:
+    """Generate attention mask for encoder-decoder attention"""
+    memory_mask = torch.zeros((batch_size, tgt_len, seq_len), device=device).bool()
+    return memory_mask
 
 class ASLTranslationModel(nn.Module):
     def __init__(
@@ -247,17 +296,15 @@ class ASLTranslationModel(nn.Module):
         dropout: float = 0.1
     ):
         super().__init__()
-        
-        # Feature extractors for different landmark types
+        # Previous initialization code remains the same...
         self.face_extractor = FeatureExtractor(3, 52)
         self.pose_extractor = FeatureExtractor(3, 52)
         self.left_hand_extractor = FeatureExtractor(3, 52)
         self.right_hand_extractor = FeatureExtractor(3, 52)
         
-        # Positional embedding
-        self.rotary_pe = RotaryPositionalEmbedding(feature_dim)
+        self.target_embedding = nn.Embedding(num_classes, feature_dim)
+        self.pos_embedding = RotaryPositionalEmbedding(feature_dim)
         
-        # Parallel encoders
         self.conformer_layers = nn.ModuleList([
             ConformerBlock(feature_dim, dropout=dropout)
             for _ in range(num_layers)
@@ -268,73 +315,85 @@ class ASLTranslationModel(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # Decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=feature_dim,
             nhead=8,
             dim_feedforward=feature_dim*4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True  # Changed to norm_first=True for better stability
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
         
-        # Output layers
         self.confidence_head = nn.Linear(feature_dim, 1)
         self.classifier = nn.Linear(feature_dim, num_classes)
-        
+        self.dropout = nn.Dropout(dropout)
+
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         tgt: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, T, L, C = x.shape  # batch, time, landmarks, channels
+        B, T, L, C = x.shape
         
-        # Split landmarks into types
-        face = x[:, :, :76]  # first 76 landmarks are face
-        pose = x[:, :, 76:88]  # next 12 landmarks are pose
-        left_hand = x[:, :, 88:109]  # next 21 landmarks are left hand
-        right_hand = x[:, :, 109:]  # remaining 21 landmarks are right hand
+        # Feature extraction
+        face = x[:, :, :76]
+        pose = x[:, :, 76:88]
+        left_hand = x[:, :, 88:109]
+        right_hand = x[:, :, 109:]
         
-        # Extract features for each type
         face_feats = self.face_extractor(face)
         pose_feats = self.pose_extractor(pose)
         left_hand_feats = self.left_hand_extractor(left_hand)
         right_hand_feats = self.right_hand_extractor(right_hand)
         
-        # Concatenate all features
         features = torch.cat(
             [face_feats, pose_feats, left_hand_feats, right_hand_feats],
             dim=-1
-        )  # [batch, time, feature_dim]
+        )
         
-        # Get rotary embeddings
-        sin, cos = self.rotary_pe(features)
+        # Encoding
+        sin, cos = self.pos_embedding(features)
         
-        # Pass through parallel encoder layers
         conformer_out = features
         squeezeformer_out = features
+        
+        encoder_padding_mask = None
+        if mask is not None:
+            encoder_padding_mask = ~mask  # Convert to padding mask
         
         for conf_layer, squeeze_layer in zip(
             self.conformer_layers,
             self.squeezeformer_layers
         ):
-            conformer_out = conf_layer(conformer_out, sin, cos, mask)
-            squeezeformer_out = squeeze_layer(squeezeformer_out, sin, cos, mask)
+            conformer_out = conf_layer(conformer_out, sin, cos, encoder_padding_mask)
+            squeezeformer_out = squeeze_layer(squeezeformer_out, sin, cos, encoder_padding_mask)
         
-        # Combine encoder outputs
         encoder_out = conformer_out + squeezeformer_out
-        
-        # Get confidence score from first token
         confidence = self.confidence_head(encoder_out[:, 0]).squeeze(-1)
         
-        # Decode if target is provided (training) else return encoder output
+        # Decoding
         if tgt is not None:
+            # Handle target sequence
+            tgt_embedded = self.target_embedding(tgt)
+            tgt_embedded = self.dropout(tgt_embedded)
+            
+            # Generate masks for decoder
+            tgt_len = tgt.size(1)
+            tgt_mask = generate_square_subsequent_mask(tgt_len).to(x.device)
+            
+            # Generate encoder-decoder attention mask
+            memory_mask = None
+            if encoder_padding_mask is not None:
+                memory_mask = encoder_padding_mask.unsqueeze(1).expand(-1, tgt_len, -1)
+            
+            # Decoder forward pass
             decoder_out = self.decoder(
-                tgt,
+                tgt_embedded,
                 encoder_out,
-                tgt_mask=generate_square_subsequent_mask(tgt.size(1)).to(tgt.device),
-                memory_mask=mask
+                tgt_mask=tgt_mask.to(dtype=torch.float32),
+                memory_key_padding_mask=memory_mask
             )
             output = self.classifier(decoder_out)
         else:
@@ -343,11 +402,8 @@ class ASLTranslationModel(nn.Module):
         return output, confidence
 
 def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
-    """Generate a square mask for the sequence. The masked positions are filled with float('-inf').
-    Unmasked positions are filled with float(0.0).
-    """
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    mask = torch.triu(torch.ones(sz, sz), diagonal=1)
+    mask = mask.masked_fill(mask == 1, float('-inf'))
     return mask
 
 class ASLTokenizer:
