@@ -77,13 +77,7 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-    def _rotate_half(self, x):
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
     def apply_rotary_pos_emb(self, q, k, sin, cos):
-        # sin/cos: [seq_len, head_dim//2]
-        # q, k: [batch, seq_len, num_heads, head_dim]
         sin = sin.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim//2]
         cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim//2]
         
@@ -120,15 +114,15 @@ class MultiHeadAttention(nn.Module):
         q = q.transpose(1, 2)  # [B, H, L, D/H]
         k = k.transpose(1, 2)  # [B, H, L, D/H]
         v = v.transpose(1, 2)  # [B, H, L, D/H]
-
+        
         # Calculate attention scores
         scale = self.head_dim ** -0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-
+        
         if mask is not None:
             # Expand mask for attention heads
-            mask = mask.unsqueeze(1)  # [B, 1, L]
-            attn = attn.masked_fill(~mask.unsqueeze(2), float('-inf'))
+            mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+            attn = attn.masked_fill(~mask, float('-inf'))
         
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
@@ -143,26 +137,23 @@ class MultiHeadAttention(nn.Module):
 class ConformerBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
+        self.dim = dim
         self.norm1 = nn.LayerNorm(dim)
         self.mhsa = MultiHeadAttention(dim, num_heads, dropout)
         
         # Convolution module
-        self.conv_module = nn.Sequential(
-            nn.LayerNorm(dim),
-            Transpose(1, 2),  # [B, D, T]
-            nn.Conv1d(dim, dim*2, 1),
-            nn.GLU(dim=1),
-            nn.Conv1d(dim, dim, 3, padding=1, groups=dim),
-            nn.BatchNorm1d(dim),
-            nn.SiLU(),
-            nn.Conv1d(dim, dim, 1),
-            nn.Dropout(dropout),
-            Transpose(1, 2),  # [B, T, D]
-        )
+        self.conv_norm = nn.LayerNorm(dim)
+        self.conv1 = nn.Conv1d(dim, dim*2, 1)
+        self.glu = nn.GLU(dim=1)
+        self.depthwise_conv = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.batch_norm = nn.BatchNorm1d(dim)
+        self.activation = nn.SiLU()
+        self.pointwise_conv = nn.Conv1d(dim, dim, 1)
+        self.conv_dropout = nn.Dropout(dropout)
         
         # Feed forward module
+        self.ff_norm = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
-            nn.LayerNorm(dim),
             nn.Linear(dim, dim*4),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -170,8 +161,6 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.scale = nn.Parameter(torch.ones(1))
 
@@ -186,12 +175,21 @@ class ConformerBlock(nn.Module):
         
         # Convolution module
         residual = x
-        x = self.conv_module(x)  # Handles its own normalization and transpose
+        x = self.conv_norm(x)
+        x = x.transpose(1, 2)  # [B, C, T]
+        x = self.conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv(x)
+        x = self.conv_dropout(x)
+        x = x.transpose(1, 2)  # [B, T, C]
         x = residual + x * self.scale
         
         # Feed forward
         residual = x
-        x = self.norm3(x)
+        x = self.ff_norm(x)
         x = self.ff(x)
         x = residual + x * self.scale
         
@@ -200,12 +198,13 @@ class ConformerBlock(nn.Module):
 class SqueezeformerBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
+        self.dim = dim
         self.norm1 = nn.LayerNorm(dim)
         self.mhsa = MultiHeadAttention(dim, num_heads, dropout)
         
-        # Feed forward module 1
+        # Feed forward modules
+        self.ff1_norm = nn.LayerNorm(dim)
         self.ff1 = nn.Sequential(
-            nn.LayerNorm(dim),
             nn.Linear(dim, dim*4),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -214,22 +213,18 @@ class SqueezeformerBlock(nn.Module):
         )
         
         # Convolution module
-        self.conv_module = nn.Sequential(
-            nn.LayerNorm(dim),
-            Transpose(1, 2),  # [B, D, T]
-            nn.Conv1d(dim, dim*2, 1),
-            nn.GLU(dim=1),
-            nn.Conv1d(dim, dim, 3, padding=1, groups=dim),
-            nn.BatchNorm1d(dim),
-            nn.SiLU(),
-            nn.Conv1d(dim, dim, 1),
-            nn.Dropout(dropout),
-            Transpose(1, 2),  # [B, T, D]
-        )
+        self.conv_norm = nn.LayerNorm(dim)
+        self.conv1 = nn.Conv1d(dim, dim*2, 1)
+        self.glu = nn.GLU(dim=1)
+        self.depthwise_conv = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.batch_norm = nn.BatchNorm1d(dim)
+        self.activation = nn.SiLU()
+        self.pointwise_conv = nn.Conv1d(dim, dim, 1)
+        self.conv_dropout = nn.Dropout(dropout)
         
         # Feed forward module 2
+        self.ff2_norm = nn.LayerNorm(dim)
         self.ff2 = nn.Sequential(
-            nn.LayerNorm(dim),
             nn.Linear(dim, dim*4),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -237,9 +232,6 @@ class SqueezeformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        self.norm4 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.scale = nn.Parameter(torch.ones(1))
 
@@ -247,44 +239,38 @@ class SqueezeformerBlock(nn.Module):
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # First feed forward
         residual = x
-        x = self.norm1(x)
+        x = self.ff1_norm(x)
         x = self.ff1(x)
         x = residual + x * self.scale
         
         # Self attention
         residual = x
-        x = self.norm2(x)
+        x = self.norm1(x)
         x = self.mhsa(x, sin, cos, mask)
         x = self.dropout(x)
         x = residual + x * self.scale
         
         # Convolution module
         residual = x
-        x = self.conv_module(x)  # Handles its own normalization and transpose
+        x = self.conv_norm(x)
+        x = x.transpose(1, 2)  # [B, C, T]
+        x = self.conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv(x)
+        x = self.conv_dropout(x)
+        x = x.transpose(1, 2)  # [B, T, C]
         x = residual + x * self.scale
         
         # Second feed forward
         residual = x
-        x = self.norm4(x)
+        x = self.ff2_norm(x)
         x = self.ff2(x)
         x = residual + x * self.scale
         
         return x
-
-# Helper class for handling transpose operations
-class Transpose(nn.Module):
-    def __init__(self, dim1, dim2):
-        super().__init__()
-        self.dim1 = dim1
-        self.dim2 = dim2
-
-    def forward(self, x):
-        return x.transpose(self.dim1, self.dim2)
-
-def generate_sequence_mask(batch_size: int, seq_len: int, tgt_len: int, device: str) -> torch.Tensor:
-    """Generate attention mask for encoder-decoder attention"""
-    memory_mask = torch.zeros((batch_size, tgt_len, seq_len), device=device).bool()
-    return memory_mask
 
 class ASLTranslationModel(nn.Module):
     def __init__(
@@ -296,15 +282,18 @@ class ASLTranslationModel(nn.Module):
         dropout: float = 0.1
     ):
         super().__init__()
-        # Previous initialization code remains the same...
+        
+        # Feature extractors for different landmark types
         self.face_extractor = FeatureExtractor(3, 52)
         self.pose_extractor = FeatureExtractor(3, 52)
         self.left_hand_extractor = FeatureExtractor(3, 52)
         self.right_hand_extractor = FeatureExtractor(3, 52)
         
+        # Target embedding
         self.target_embedding = nn.Embedding(num_classes, feature_dim)
         self.pos_embedding = RotaryPositionalEmbedding(feature_dim)
         
+        # Parallel encoders
         self.conformer_layers = nn.ModuleList([
             ConformerBlock(feature_dim, dropout=dropout)
             for _ in range(num_layers)
@@ -315,16 +304,18 @@ class ASLTranslationModel(nn.Module):
             for _ in range(num_layers)
         ])
         
+        # Decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=feature_dim,
             nhead=8,
             dim_feedforward=feature_dim*4,
             dropout=dropout,
             batch_first=True,
-            norm_first=True  # Changed to norm_first=True for better stability
+            norm_first=True
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
         
+        # Output layers
         self.confidence_head = nn.Linear(feature_dim, 1)
         self.classifier = nn.Linear(feature_dim, num_classes)
         self.dropout = nn.Dropout(dropout)
@@ -337,7 +328,7 @@ class ASLTranslationModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, L, C = x.shape
         
-        # Feature extraction
+        # Extract features
         face = x[:, :, :76]
         pose = x[:, :, 76:88]
         left_hand = x[:, :, 88:109]
@@ -353,15 +344,18 @@ class ASLTranslationModel(nn.Module):
             dim=-1
         )
         
-        # Encoding
+        # Process features through encoder
         sin, cos = self.pos_embedding(features)
+        
+        # (Continuing the ASLTranslationModel forward method)
         
         conformer_out = features
         squeezeformer_out = features
         
+        # Convert mask to padding mask for encoder if provided
         encoder_padding_mask = None
         if mask is not None:
-            encoder_padding_mask = ~mask  # Convert to padding mask
+            encoder_padding_mask = mask  # [B, T]
         
         for conf_layer, squeeze_layer in zip(
             self.conformer_layers,
@@ -373,33 +367,112 @@ class ASLTranslationModel(nn.Module):
         encoder_out = conformer_out + squeezeformer_out
         confidence = self.confidence_head(encoder_out[:, 0]).squeeze(-1)
         
-        # Decoding
         if tgt is not None:
-            # Handle target sequence
-            tgt_embedded = self.target_embedding(tgt)
+            # Process target sequence
+            tgt_embedded = self.target_embedding(tgt)  # [B, tgt_len, dim]
             tgt_embedded = self.dropout(tgt_embedded)
             
-            # Generate masks for decoder
+            # Create causal mask for target self-attention
             tgt_len = tgt.size(1)
-            tgt_mask = generate_square_subsequent_mask(tgt_len).to(x.device)
+            tgt_mask = self.generate_square_subsequent_mask(tgt_len).to(x.device)
             
-            # Generate encoder-decoder attention mask
-            memory_mask = None
+            # Create memory padding mask for encoder-decoder attention
+            memory_padding_mask = None
             if encoder_padding_mask is not None:
-                memory_mask = encoder_padding_mask.unsqueeze(1).expand(-1, tgt_len, -1)
+                memory_padding_mask = ~encoder_padding_mask  # Convert to padding mask format
             
             # Decoder forward pass
             decoder_out = self.decoder(
                 tgt_embedded,
                 encoder_out,
-                tgt_mask=tgt_mask.to(dtype=torch.float32),
-                memory_key_padding_mask=memory_mask
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=memory_padding_mask
             )
             output = self.classifier(decoder_out)
         else:
             output = self.classifier(encoder_out)
         
         return output, confidence
+
+    @staticmethod
+    def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
+        """Generate causal mask for decoder self-attention"""
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        mask = mask.masked_fill(mask == 0, float(0.0))
+        return mask
+
+def train_step(
+    model: ASLTranslationModel,
+    batch: dict,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: str = 'cuda',
+    grad_scaler = None
+) -> float:
+    """Perform one training step"""
+    optimizer.zero_grad()
+    
+    # Move batch to device
+    landmarks = batch['landmarks'].to(device)
+    tokens = batch['tokens'].to(device)
+    mask = batch['mask'].to(device) if 'mask' in batch else None
+    
+    # Forward pass with mixed precision
+    with torch.cuda.amp.autocast():
+        pred, confidence = model(landmarks, mask, tokens[:, :-1])
+        
+        # Calculate confidence target (normalized Levenshtein distance)
+        with torch.no_grad():
+            confidence_target = torch.tensor([
+                1 - Levenshtein.distance(
+                    model.tokenizer.decode(p.argmax(-1).cpu()),
+                    true_text
+                ) / max(len(true_text), 1)
+                for p, true_text in zip(pred, batch['phrase'])
+            ]).to(device)
+        
+        # Calculate loss
+        loss = criterion(pred, tokens[:, 1:], confidence, confidence_target)
+    
+    # Backward pass with gradient scaling
+    if grad_scaler is not None:
+        grad_scaler.scale(loss).backward()
+        grad_scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+    
+    return loss.item()
+
+class ASLTranslationLoss(nn.Module):
+    """Combined loss function for sequence prediction and confidence score"""
+    def __init__(self, pad_idx: int = 0):
+        super().__init__()
+        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+        
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        confidence: torch.Tensor,
+        confidence_target: torch.Tensor
+    ) -> torch.Tensor:
+        # Main sequence prediction loss
+        seq_loss = self.criterion(
+            pred.reshape(-1, pred.size(-1)),
+            target.reshape(-1)
+        )
+        
+        # Confidence prediction loss (MSE)
+        conf_loss = F.mse_loss(confidence, confidence_target)
+        
+        # Combine losses
+        return seq_loss + 0.1 * conf_loss
 
 def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
     mask = torch.triu(torch.ones(sz, sz), diagonal=1)
@@ -668,34 +741,6 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'phrase': [item['phrase'] for item in batch],
         'length': lengths
     }
-
-# Model components from previous artifact: FeatureExtractor, RotaryPositionalEmbedding, 
-# MultiHeadAttention, ConformerBlock, SqueezeformerBlock, ASLTranslationModel...
-
-class ASLTranslationLoss(nn.Module):
-    """Combined loss function for sequence prediction and confidence score"""
-    def __init__(self, pad_idx: int = 0):
-        super().__init__()
-        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-        
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        confidence: torch.Tensor,
-        confidence_target: torch.Tensor
-    ) -> torch.Tensor:
-        # Main sequence prediction loss
-        seq_loss = self.criterion(
-            pred.view(-1, pred.size(-1)),
-            target.view(-1)
-        )
-        
-        # Confidence prediction loss (MSE)
-        conf_loss = F.mse_loss(confidence, confidence_target)
-        
-        # Combine losses
-        return seq_loss + 0.1 * conf_loss
     
 class Trainer:
     """Training controller for ASL Translation model"""
@@ -716,6 +761,7 @@ class Trainer:
         self.val_loader = val_loader
         self.tokenizer = tokenizer
         self.device = device
+        self.max_epochs = max_epochs
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -854,17 +900,24 @@ class Trainer:
         """Train model for specified number of epochs"""
         os.makedirs(save_dir, exist_ok=True)
         
-        for epoch in range(self.num_training_steps // len(self.train_loader)):
-            print(f"\nEpoch {epoch + 1}")
+        print(f"\nStarting training for {self.max_epochs} epochs")
+        print("=" * 50)
+        
+        for epoch in range(self.max_epochs):
+            print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
+            print("-" * 30)
             
             # Train
             train_loss = self.train_epoch()
-            print(f"Training Loss: {train_loss:.4f}")
             
             # Validate
             val_loss, val_score = self.validate()
-            print(f"Validation Loss: {val_loss:.4f}")
+            
+            # Print metrics
+            print(f"Training Loss:    {train_loss:.4f}")
+            print(f"Validation Loss:  {val_loss:.4f}")
             print(f"Validation Score: {val_score:.4f}")
+            print(f"Learning Rate:    {self.optimizer.param_groups[0]['lr']:.6f}")
             
             # Save best model
             if val_score > self.best_score:
@@ -879,10 +932,11 @@ class Trainer:
                     },
                     os.path.join(save_dir, 'best_model.pt')
                 )
-                print(f"Saved new best model with score: {val_score:.4f}")
+                print(f"✓ Saved new best model with score: {val_score:.4f}")
             
-            # Save checkpoint
-            if (epoch + 1) % 10 == 0:
+            # Save checkpoint every 40 epochs
+            if (epoch + 1) % 40 == 0:
+                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
                 torch.save(
                     {
                         'epoch': epoch,
@@ -891,8 +945,9 @@ class Trainer:
                         'scheduler_state_dict': self.scheduler.state_dict(),
                         'best_score': self.best_score,
                     },
-                    os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                    checkpoint_path
                 )
+                print(f"✓ Saved checkpoint at epoch {epoch+1}")
 
 def main():
     # Set random seeds for reproducibility
