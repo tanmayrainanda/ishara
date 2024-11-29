@@ -15,7 +15,12 @@ import Levenshtein
 from tqdm.auto import tqdm
 import time
 import pyarrow.parquet as pq
+import wandb
+import sys
 
+wandb.login(key="afe8b8c0a3f1c1339a3daa9f619cb7c311218022")
+wandb.init(project="asl-translation")
+    
 class FeatureExtractor(nn.Module):
     def __init__(self, input_channels: int = 3, output_dim: int = 52):
         super().__init__()
@@ -743,7 +748,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
     
 class Trainer:
-    """Training controller for ASL Translation model"""
+    """Training controller for ASL Translation model with WandB logging"""
     def __init__(
         self,
         model: nn.Module,
@@ -754,7 +759,8 @@ class Trainer:
         weight_decay: float = 0.08,
         warmup_epochs: int = 10,
         max_epochs: int = 400,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        wandb_config: dict = None
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -762,6 +768,25 @@ class Trainer:
         self.tokenizer = tokenizer
         self.device = device
         self.max_epochs = max_epochs
+        self.wandb_config = wandb_config
+        
+        # Initialize WandB
+        # Initialize WandB
+        if wandb_config:
+            wandb.init(
+                project=wandb_config['project'],
+                name=wandb_config['run_name'],
+                config={
+                    'learning_rate': learning_rate,
+                    'weight_decay': weight_decay,
+                    'warmup_epochs': warmup_epochs,
+                    'max_epochs': max_epochs,
+                    'batch_size': train_loader.batch_size,
+                    'architecture': 'Conformer-Squeezeformer'
+                }
+            )
+            # Watch model gradients
+            wandb.watch(model, log_freq=100)
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -781,11 +806,7 @@ class Trainer:
         # Gradient scaler for mixed precision training
         self.scaler = GradScaler()
         
-        # Best validation score
-        self.best_score = float('-inf')
-        
     def get_scheduler(self):
-        """Create cosine learning rate scheduler with warmup"""
         return torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.optimizer.param_groups[0]['lr'],
@@ -796,56 +817,102 @@ class Trainer:
         )
     
     def train_epoch(self) -> float:
-        """Train for one epoch"""
+        """Train for one epoch with proper progress tracking and WandB logging"""
         self.model.train()
         total_loss = 0
+        num_batches = len(self.train_loader)
         
-        for batch in tqdm(self.train_loader, desc='Training'):
-            self.optimizer.zero_grad()
-            
-            # Move batch to device
-            landmarks = batch['landmarks'].to(self.device)
-            tokens = batch['tokens'].to(self.device)
-            lengths = batch['length'].to(self.device)
-            
-            # Create mask based on sequence lengths - ensure arange is on same device
-            seq_length = landmarks.size(1)
-            position_indices = torch.arange(seq_length, device=self.device)[None, :]
-            mask = position_indices < lengths[:, None]
-            
-            # Forward pass with mixed precision
-            with autocast():
-                pred, confidence = self.model(landmarks, mask, tokens[:, :-1])
-                
-                # Calculate normalized Levenshtein distance for confidence target
-                with torch.no_grad():
-                    confidence_target = torch.tensor([
-                        1 - Levenshtein.distance(
-                            self.tokenizer.decode(p.argmax(-1).cpu()),
-                            true_text
-                        ) / max(len(true_text), 1)
-                        for p, true_text in zip(pred, batch['phrase'])
-                    ], device=self.device)
-                
-                # Calculate loss
-                loss = self.criterion(pred, tokens[:, 1:], confidence, confidence_target)
-            
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
-            
-            # Clip gradients
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            
-            # Optimizer and scheduler step
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
-            
-            total_loss += loss.item()
+        progress_bar = tqdm(
+            self.train_loader,
+            desc='Training',
+            leave=True,
+            position=0,
+            dynamic_ncols=True
+        )
         
-        return total_loss / len(self.train_loader)
-    
+        try:
+            for batch_idx, batch in enumerate(progress_bar):
+                try:
+                    self.optimizer.zero_grad()
+                    
+                    # Move batch to device
+                    landmarks = batch['landmarks'].to(self.device)
+                    tokens = batch['tokens'].to(self.device)
+                    lengths = batch['length'].to(self.device)
+                    
+                    # Create mask based on sequence lengths
+                    seq_length = landmarks.size(1)
+                    position_indices = torch.arange(seq_length, device=self.device)[None, :]
+                    mask = position_indices < lengths[:, None]
+                    
+                    try:
+                        with autocast():
+                            pred, confidence = self.model(landmarks, mask, tokens[:, :-1])
+                            
+                            # Calculate confidence target
+                            with torch.no_grad():
+                                confidence_target = torch.tensor([
+                                    1 - Levenshtein.distance(
+                                        self.tokenizer.decode(p.argmax(-1).cpu()),
+                                        true_text
+                                    ) / max(len(true_text), 1)
+                                    for p, true_text in zip(pred, batch['phrase'])
+                                ], device=self.device)
+                            
+                            loss = self.criterion(pred, tokens[:, 1:], confidence, confidence_target)
+                        
+                        # Backward pass with gradient scaling
+                        self.scaler.scale(loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.scheduler.step()
+                        
+                        # Update metrics
+                        total_loss += loss.item()
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        
+                        # Log to WandB
+                        if self.wandb_config and batch_idx % 10 == 0:  # Log every 10 batches
+                            wandb.log({
+                                'batch_loss': loss.item(),
+                                'learning_rate': current_lr,
+                                'batch_confidence': confidence.mean().item(),
+                                'batch_confidence_target': confidence_target.mean().item()
+                            })
+                        
+                        # Update progress bar
+                        progress_bar.set_postfix({
+                            'batch_loss': f'{loss.item():.4f}',
+                            'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
+                            'lr': f'{current_lr:.2e}',
+                            'batch': f'{batch_idx+1}/{num_batches}'
+                        })
+                        
+                        if batch_idx % 10 == 0:
+                            progress_bar.refresh()
+                    
+                    except RuntimeError as e:
+                        print(f"\nError in forward/backward pass: {str(e)}")
+                        if "out of memory" in str(e):
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        continue
+                    
+                except Exception as e:
+                    print(f"\nError processing batch {batch_idx}: {str(e)}")
+                    continue
+        
+        except KeyboardInterrupt:
+            print("\nTraining interrupted by user")
+            return total_loss / (batch_idx + 1) if batch_idx > 0 else float('inf')
+        
+        finally:
+            progress_bar.close()
+        
+        return total_loss / num_batches
+
     @torch.no_grad()
     def validate(self) -> Tuple[float, float]:
         """Validate model and compute metrics"""
@@ -853,6 +920,7 @@ class Trainer:
         total_loss = 0
         predictions = []
         ground_truth = []
+        confidence_scores = []
         
         for batch in tqdm(self.val_loader, desc='Validating'):
             # Move batch to device
@@ -866,6 +934,7 @@ class Trainer:
             
             # Forward pass
             pred, confidence = self.model(landmarks, mask)
+            confidence_scores.extend(confidence.cpu().tolist())
             
             # Decode predictions
             pred_texts = [
@@ -894,60 +963,121 @@ class Trainer:
         ]
         avg_score = sum(distances) / len(distances)
         
+        # Log validation examples to WandB
+        if self.wandb_config:
+            # Log validation metrics
+            wandb.log({
+                'val_loss': avg_loss,
+                'val_score': avg_score,
+                'val_confidence_mean': np.mean(confidence_scores),
+                'val_confidence_std': np.std(confidence_scores)
+            })
+            
+            # Log prediction examples
+            examples = []
+            for i in range(min(10, len(predictions))):
+                examples.append(wandb.Table(
+                    columns=['Ground Truth', 'Prediction', 'Score'],
+                    data=[[ground_truth[i], predictions[i], distances[i]]]
+                ))
+            wandb.log({"prediction_examples": examples})
+        
         return avg_loss, avg_score
-    
+
     def train(self, save_dir: str):
-        """Train model for specified number of epochs"""
+        """Train model with improved logging and error handling"""
         os.makedirs(save_dir, exist_ok=True)
         
         print(f"\nStarting training for {self.max_epochs} epochs")
+        print(f"Training device: {self.device}")
+        print(f"Number of training batches: {len(self.train_loader)}")
         print("=" * 50)
         
-        for epoch in range(self.max_epochs):
-            print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
-            print("-" * 30)
-            
-            # Train
-            train_loss = self.train_epoch()
-            
-            # Validate
-            val_loss, val_score = self.validate()
-            
-            # Print metrics
-            print(f"Training Loss:    {train_loss:.4f}")
-            print(f"Validation Loss:  {val_loss:.4f}")
-            print(f"Validation Score: {val_score:.4f}")
-            print(f"Learning Rate:    {self.optimizer.param_groups[0]['lr']:.6f}")
-            
-            # Save best model
-            if val_score > self.best_score:
-                self.best_score = val_score
-                torch.save(
-                    {
+        best_val_score = float('-inf')
+        
+        try:
+            for epoch in range(self.max_epochs):
+                epoch_start_time = time.time()
+                
+                print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
+                print("-" * 30)
+                
+                # Train epoch
+                train_loss = self.train_epoch()
+                epoch_time = time.time() - epoch_start_time
+                
+                # Print and log metrics
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"Training Loss: {train_loss:.4f}")
+                print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+                print(f"Epoch Time: {epoch_time:.1f}s")
+                
+                if self.wandb_config:
+                    wandb.log({
+                        'epoch': epoch + 1,
+                        'train_loss': train_loss,
+                        'epoch_time': epoch_time
+                    })
+                
+                # Validate and save checkpoint periodically
+                if (epoch + 1) % 5 == 0:
+                    print("\nRunning validation...")
+                    val_loss, val_score = self.validate()
+                    print(f"Validation Loss: {val_loss:.4f}")
+                    print(f"Validation Score: {val_score:.4f}")
+                    
+                    # Save best model
+                    if val_score > best_val_score:
+                        best_val_score = val_score
+                        checkpoint_path = os.path.join(save_dir, 'best_model.pt')
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': self.model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict(),
+                            'val_score': val_score,
+                        }, checkpoint_path)
+                        print(f"✓ Saved new best model (score: {val_score:.4f})")
+                        
+                        if self.wandb_config:
+                            wandb.log({'best_val_score': val_score})
+                
+                # Save periodic checkpoint
+                if (epoch + 1) % 40 == 0:
+                    checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                    torch.save({
                         'epoch': epoch,
                         'model_state_dict': self.model.state_dict(),
                         'optimizer_state_dict': self.optimizer.state_dict(),
                         'scheduler_state_dict': self.scheduler.state_dict(),
-                        'best_score': self.best_score,
-                    },
-                    os.path.join(save_dir, 'best_model.pt')
-                )
-                print(f"✓ Saved new best model with score: {val_score:.4f}")
+                    }, checkpoint_path)
+                    print(f"✓ Saved checkpoint at epoch {epoch+1}")
+                
+                # Force flush stdout
+                sys.stdout.flush()
+        
+        except KeyboardInterrupt:
+            print("\nTraining interrupted by user")
+        
+        except Exception as e:
+            print(f"\nTraining failed with error: {str(e)}")
+            raise
+        
+        finally:
+            # Save final model
+            final_path = os.path.join(save_dir, 'final_model.pt')
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'best_score': best_val_score,
+            }, final_path)
+            print(f"\n✓ Saved final model")
             
-            # Save checkpoint every 40 epochs
-            if (epoch + 1) % 40 == 0:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                torch.save(
-                    {
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'scheduler_state_dict': self.scheduler.state_dict(),
-                        'best_score': self.best_score,
-                    },
-                    checkpoint_path
-                )
-                print(f"✓ Saved checkpoint at epoch {epoch+1}")
+            # Finish WandB run
+            if self.wandb_config:
+                wandb.finish()
 
 def main():
     # Set random seeds for reproducibility
@@ -955,8 +1085,9 @@ def main():
     random.seed(42)
     np.random.seed(42)
     
+    # Configuration
     config = {
-        'data_dir': '/kaggle/input/asl-fingerspelling/train_landmarks',  # Directory containing parquet files
+        'data_dir': '/kaggle/input/asl-fingerspelling/train_landmarks',
         'metadata_path': '/kaggle/input/asl-fingerspelling/train.csv',
         'vocab_path': '/kaggle/input/asl-fingerspelling/character_to_prediction_index.json',
         'save_dir': '/kaggle/working/models',
@@ -965,82 +1096,115 @@ def main():
         'num_workers': 2,
         'learning_rate': 0.0045,
         'weight_decay': 0.08,
-        'warmup_epochs': 10,
-        'max_epochs': 150,
+        'warmup_epochs': 1,
+        'max_epochs': 2,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'wandb_project': 'asl-translation',
-        'wandb_entity': None,
-        'run_name': f'asl-translation-{time.strftime("%Y%m%d-%H%M%S")}',
+        'run_name': f'asl-translation-{time.strftime("%Y%m%d-%H%M%S")}'
     }
 
+    # WandB configuration
+    wandb_config = {
+        'project': config['wandb_project'],
+        'run_name': config['run_name']
+    }
+
+    print("\nInitializing training...")
+    print(f"Device: {config['device']}")
+    
     # Make sure save directory exists
     os.makedirs(config['save_dir'], exist_ok=True)
+    
+    try:
+        # Initialize tokenizer
+        print("Loading tokenizer...")
+        tokenizer = ASLTokenizer(config['vocab_path'])
         
-    # Initialize tokenizer
-    tokenizer = ASLTokenizer(config['vocab_path'])
+        # Create datasets
+        print("\nCreating datasets...")
+        train_dataset = ASLDataset(
+            config['data_dir'],
+            config['metadata_path'],
+            tokenizer,
+            max_len=config['max_len'],
+            augment=True,
+            mode='train'
+        )
+        
+        val_dataset = ASLDataset(
+            config['data_dir'],
+            config['metadata_path'],
+            tokenizer,
+            max_len=config['max_len'],
+            augment=False,
+            mode='val'
+        )
+        
+        print(f"Training samples: {len(train_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}")
+        
+        # Create dataloaders
+        print("\nCreating dataloaders...")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=config['num_workers'],
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=config['num_workers'],
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+        
+        # Create model
+        print("\nInitializing model...")
+        model = ASLTranslationModel(
+            num_landmarks=130,
+            feature_dim=208,
+            num_classes=len(tokenizer.char_to_idx),
+            num_layers=7,
+            dropout=0.1
+        )
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # Initialize trainer
+        print("\nInitializing trainer...")
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            tokenizer=tokenizer,
+            learning_rate=config['learning_rate'],
+            weight_decay=config['weight_decay'],
+            warmup_epochs=config['warmup_epochs'],
+            max_epochs=config['max_epochs'],
+            device=config['device'],
+            wandb_config=wandb_config
+        )
+        
+        # Train model
+        print("\nStarting training...")
+        trainer.train(config['save_dir'])
+
+    except Exception as e:
+        print(f"\nTraining failed with error: {str(e)}")
+        raise
     
-    # Create datasets
-    train_dataset = ASLDataset(
-        config['data_dir'],
-        config['metadata_path'],
-        tokenizer,
-        max_len=config['max_len'],
-        augment=True,
-        mode='train'
-    )
-    
-    val_dataset = ASLDataset(
-        config['data_dir'],
-        config['metadata_path'],
-        tokenizer,
-        max_len=config['max_len'],
-        augment=False,
-        mode='val'
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    
-    # Create model
-    model = ASLTranslationModel(
-        num_landmarks=130,
-        feature_dim=208,
-        num_classes=len(tokenizer.char_to_idx),
-        num_layers=7,
-        dropout=0.1
-    )
-    
-    # Initialize trainer
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        tokenizer=tokenizer,
-        learning_rate=config['learning_rate'],
-        weight_decay=config['weight_decay'],
-        warmup_epochs=config['warmup_epochs'],
-        max_epochs=config['max_epochs'],
-        device=config['device']
-    )
-    
-    # Train model
-    trainer.train(config['save_dir'])
+    finally:
+        # Clean up wandb
+        if wandb.run is not None:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()
