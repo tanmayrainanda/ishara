@@ -20,7 +20,7 @@ import sys
 
 wandb.login(key="afe8b8c0a3f1c1339a3daa9f619cb7c311218022")
 wandb.init(project="asl-translation")
-    
+
 class FeatureExtractor(nn.Module):
     def __init__(self, input_channels: int = 3, output_dim: int = 52):
         super().__init__()
@@ -1084,6 +1084,10 @@ def main():
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs")
+        model = nn.DataParallel(model)
+    
     
     # Configuration
     config = {
@@ -1091,7 +1095,7 @@ def main():
         'metadata_path': '/kaggle/input/asl-fingerspelling/train.csv',
         'vocab_path': '/kaggle/input/asl-fingerspelling/character_to_prediction_index.json',
         'save_dir': '/kaggle/working/models',
-        'batch_size': 32,
+        'batch_size': 200,
         'max_len': 384,
         'num_workers': 2,
         'learning_rate': 0.0045,
