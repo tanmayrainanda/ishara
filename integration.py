@@ -283,7 +283,7 @@ class ASLTranslationModel(nn.Module):
         num_landmarks: int = 130,
         feature_dim: int = 208,
         num_classes: int = 59,
-        num_layers: int = 7,
+        num_layers: int = 2,
         dropout: float = 0.1
     ):
         super().__init__()
