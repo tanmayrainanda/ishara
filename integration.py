@@ -650,29 +650,29 @@ class ASLDataset(Dataset):
         # Landmark dropping
         if random.random() < 0.5 and T >= 20:  # Only apply to sequences long enough
             # Randomly drop fingers
-            num_fingers = random.randint(1, 3)  # Reduced from 2-6 to 1-3
-            num_windows = random.randint(1, 2)  # Reduced from 2-3 to 1-2
+            num_fingers = random.randint(1, 3)
+            num_windows = random.randint(1, 2)
             
             for _ in range(num_windows):
                 if T <= 20:  # Skip if sequence too short
                     break
                 
-                window_size = min(random.randint(5, 10), T-1)  # Reduced window size
+                window_size = min(random.randint(5, 10), T-1)
                 window_start = random.randint(0, T - window_size)
                 window_end = window_start + window_size
                 
                 for _ in range(num_fingers):
-                    finger_start = random.randint(88, 126)  # Adjusted range
+                    finger_start = random.randint(88, 126)
                     landmarks[window_start:window_end, finger_start:finger_start+4] = 0
         
-        if random.random() < 0.3:  # Reduced probability from 0.5
+        if random.random() < 0.3:
             # Drop face or pose landmarks
             if random.random() < 0.5:
                 landmarks[:, :76] = 0  # Face
             else:
                 landmarks[:, 76:88] = 0  # Pose
         
-        if random.random() < 0.05:  # Keep rare complete hand dropping
+        if random.random() < 0.05:
             # Drop all hand landmarks
             landmarks[:, 88:] = 0
         
@@ -703,7 +703,8 @@ class ASLDataset(Dataset):
         landmarks = self.get_landmarks(row['sequence_id'])
         landmarks = self.normalize_landmarks(landmarks)
         
-        if self.augment:
+        # Only apply augmentations to 20% of the data when augment flag is True
+        if self.augment and random.random() < 0.2:
             landmarks = self.augment_landmarks(landmarks)
             
         # Pad or resize sequence to max_len
@@ -757,8 +758,8 @@ class Trainer:
         tokenizer: ASLTokenizer,
         learning_rate: float = 0.0045,
         weight_decay: float = 0.08,
-        warmup_epochs: int = 10,
-        max_epochs: int = 400,
+        warmup_epochs: int = 1,
+        max_epochs: int = 2,
         device: str = 'cuda',
         wandb_config: dict = None
     ):
@@ -1084,10 +1085,6 @@ def main():
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)
-    if torch.cuda.device_count() > 1:
-        print("Using", torch.cuda.device_count(), "GPUs")
-        model = nn.DataParallel(model)
-    
     
     # Configuration
     config = {
@@ -1095,7 +1092,7 @@ def main():
         'metadata_path': '/kaggle/input/asl-fingerspelling/train.csv',
         'vocab_path': '/kaggle/input/asl-fingerspelling/character_to_prediction_index.json',
         'save_dir': '/kaggle/working/models',
-        'batch_size': 200,
+        'batch_size': 64,
         'max_len': 384,
         'num_workers': 2,
         'learning_rate': 0.0045,
@@ -1173,9 +1170,12 @@ def main():
             num_landmarks=130,
             feature_dim=208,
             num_classes=len(tokenizer.char_to_idx),
-            num_layers=7,
+            num_layers=2,
             dropout=0.1
         )
+        if torch.cuda.device_count() > 1:
+            print("Using", torch.cuda.device_count(), "GPUs")
+            model = nn.DataParallel(model)
         
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
