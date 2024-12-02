@@ -298,12 +298,7 @@ class ASLTranslationModel(nn.Module):
         self.target_embedding = nn.Embedding(num_classes, feature_dim)
         self.pos_embedding = RotaryPositionalEmbedding(feature_dim)
         
-        # Parallel encoders
-        self.conformer_layers = nn.ModuleList([
-            ConformerBlock(feature_dim, dropout=dropout)
-            for _ in range(num_layers)
-        ])
-        
+        # Squeezeformer encoder
         self.squeezeformer_layers = nn.ModuleList([
             SqueezeformerBlock(feature_dim, dropout=dropout)
             for _ in range(num_layers)
@@ -349,27 +344,18 @@ class ASLTranslationModel(nn.Module):
             dim=-1
         )
         
-        # Process features through encoder
+        # Get positional embeddings
         sin, cos = self.pos_embedding(features)
         
-        # (Continuing the ASLTranslationModel forward method)
-        
-        conformer_out = features
-        squeezeformer_out = features
-        
-        # Convert mask to padding mask for encoder if provided
+        # Process features through Squeezeformer encoder
+        encoder_out = features
         encoder_padding_mask = None
         if mask is not None:
             encoder_padding_mask = mask  # [B, T]
         
-        for conf_layer, squeeze_layer in zip(
-            self.conformer_layers,
-            self.squeezeformer_layers
-        ):
-            conformer_out = conf_layer(conformer_out, sin, cos, encoder_padding_mask)
-            squeezeformer_out = squeeze_layer(squeezeformer_out, sin, cos, encoder_padding_mask)
+        for layer in self.squeezeformer_layers:
+            encoder_out = layer(encoder_out, sin, cos, encoder_padding_mask)
         
-        encoder_out = conformer_out + squeezeformer_out
         confidence = self.confidence_head(encoder_out[:, 0]).squeeze(-1)
         
         if tgt is not None:
@@ -549,135 +535,29 @@ class ASLDataset(Dataset):
         else:
             self.df = df[df['participant_id'].isin(val_participants)]
         
-        # Get parquet files in directory
-        self.parquet_files = sorted(list(Path(data_dir).glob('*.parquet')))
-        print(f"Found {len(self.parquet_files)} parquet files")
+        # Create efficient parquet file index
+        self.sequence_data = {}
+        for parquet_file in tqdm(list(Path(data_dir).glob('*.parquet')), desc='Loading data'):
+            # Read all data at once efficiently
+            table = pq.read_table(parquet_file)
+            df_chunk = table.to_pandas()
+            
+            # Group by sequence_id
+            for seq_id, group in df_chunk.groupby('sequence_id'):
+                if seq_id in self.df['sequence_id'].values:
+                    landmark_cols = [col for col in group.columns if col not in ['sequence_id', 'frame']]
+                    landmarks = group[landmark_cols].values
+                    # Pre-reshape landmarks
+                    num_landmarks = len(landmark_cols) // 3
+                    landmarks = landmarks.reshape(-1, num_landmarks, 3)
+                    # Pre-normalize landmarks
+                    landmarks = self.normalize_landmarks(landmarks)
+                    self.sequence_data[seq_id] = landmarks
         
-        # Create mapping of sequence_id to parquet file
-        self.sequence_to_file = {}
-        for parquet_file in tqdm(self.parquet_files, desc='Indexing parquet files'):
-            # Read sequence_ids from parquet file without loading data
-            table = pq.read_table(parquet_file, columns=['sequence_id'])
-            sequences = table['sequence_id'].to_pylist()
-            for seq_id in sequences:
-                self.sequence_to_file[seq_id] = parquet_file
-                
         # Filter df to only include sequences we have data for
-        self.df = self.df[self.df['sequence_id'].isin(self.sequence_to_file.keys())]
+        self.df = self.df[self.df['sequence_id'].isin(self.sequence_data.keys())]
         print(f"Dataset contains {len(self.df)} sequences")
         
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def get_landmarks(self, sequence_id: str) -> np.ndarray:
-        """Load landmarks for a specific sequence from parquet file"""
-        parquet_file = self.sequence_to_file[sequence_id]
-        
-        # Read the specific sequence from parquet file
-        table = pq.read_table(
-            parquet_file,
-            filters=[('sequence_id', '=', sequence_id)]
-        )
-        df = table.to_pandas()
-        
-        # Extract landmark columns (excluding sequence_id and frame)
-        landmark_cols = [col for col in df.columns if col not in ['sequence_id', 'frame']]
-        landmarks = df[landmark_cols].values
-        
-        # Reshape landmarks to (frames, landmarks, 3)
-        num_landmarks = len(landmark_cols) // 3
-        landmarks = landmarks.reshape(-1, num_landmarks, 3)
-        
-        return landmarks
-        
-    def augment_landmarks(self, landmarks: torch.Tensor) -> torch.Tensor:
-        """Apply augmentations to landmark sequence with safety checks"""
-        T = landmarks.shape[0]  # sequence length
-        
-        # Time augmentations
-        if random.random() < 0.8:
-            # Random resize along time axis
-            scale = random.uniform(0.8, 1.2)
-            new_T = int(T * scale)
-            if new_T > 0:  # Only resize if new length is valid
-                indices = torch.linspace(0, T-1, new_T).long()
-                landmarks = landmarks[indices]
-                T = new_T  # Update sequence length
-        
-        if random.random() < 0.5 and T > 1:
-            # Random time shift
-            shift = random.randint(-min(5, T//2), min(5, T//2))
-            landmarks = torch.roll(landmarks, shift, dims=0)
-        
-        # Spatial augmentations
-        if random.random() < 0.8:
-            # Random spatial affine
-            angle = random.uniform(-30, 30)
-            scale = random.uniform(0.8, 1.2)
-            shear = random.uniform(-0.2, 0.2)
-            translate = (random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1))
-            
-            theta = torch.tensor([
-                [scale * math.cos(angle), -scale * math.sin(angle) + shear, translate[0]],
-                [scale * math.sin(angle) + shear, scale * math.cos(angle), translate[1]]
-            ]).float()[None]  # Add batch dimension
-            
-            # Handle each frame separately
-            landmarks_2d = landmarks[..., :2]  # Only x,y coordinates
-            
-            # Process each frame
-            transformed_frames = []
-            for t in range(T):
-                frame = landmarks_2d[t:t+1]  # Add batch dimension
-                
-                grid = F.affine_grid(
-                    theta,
-                    size=(1, 1, frame.shape[1], 2),
-                    align_corners=False
-                )
-                
-                transformed = F.grid_sample(
-                    frame[:, None],  # Add channel dimension
-                    grid,
-                    align_corners=False
-                )
-                transformed_frames.append(transformed[:, 0])  # Remove channel dimension
-            
-            # Stack frames back together
-            landmarks_2d = torch.cat(transformed_frames, dim=0)
-            landmarks[..., :2] = landmarks_2d
-        
-        # Landmark dropping
-        if random.random() < 0.5 and T >= 20:  # Only apply to sequences long enough
-            # Randomly drop fingers
-            num_fingers = random.randint(1, 3)
-            num_windows = random.randint(1, 2)
-            
-            for _ in range(num_windows):
-                if T <= 20:  # Skip if sequence too short
-                    break
-                
-                window_size = min(random.randint(5, 10), T-1)
-                window_start = random.randint(0, T - window_size)
-                window_end = window_start + window_size
-                
-                for _ in range(num_fingers):
-                    finger_start = random.randint(88, 126)
-                    landmarks[window_start:window_end, finger_start:finger_start+4] = 0
-        
-        if random.random() < 0.3:
-            # Drop face or pose landmarks
-            if random.random() < 0.5:
-                landmarks[:, :76] = 0  # Face
-            else:
-                landmarks[:, 76:88] = 0  # Pose
-        
-        if random.random() < 0.05:
-            # Drop all hand landmarks
-            landmarks[:, 88:] = 0
-        
-        return landmarks
-    
     def normalize_landmarks(self, landmarks: np.ndarray) -> torch.Tensor:
         """Normalize landmarks with mean and std"""
         # Convert to tensor
@@ -696,12 +576,14 @@ class ASLDataset(Dataset):
         
         return landmarks
     
+    def __len__(self) -> int:
+        return len(self.df)
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
         
-        # Load landmarks
-        landmarks = self.get_landmarks(row['sequence_id'])
-        landmarks = self.normalize_landmarks(landmarks)
+        # Get pre-loaded landmarks
+        landmarks = self.sequence_data[row['sequence_id']]
         
         # Only apply augmentations to 20% of the data when augment flag is True
         if self.augment and random.random() < 0.2:
