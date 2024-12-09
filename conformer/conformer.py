@@ -85,3 +85,39 @@ class ConformerEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, attn_mask=attn_mask)
         return x
+    
+# # Define the Conformer model
+# conformer_model = ConformerEncoder(dim=512, num_layers=6, num_heads=8, expansion_factor=4, kernel_size=31, dropout=0.1)
+
+# # Define optimizer and loss function for Conformer
+# optimizer = torch.optim.Adam(conformer_model.parameters(), lr=1e-4)
+# loss_fn = torch.nn.CrossEntropyLoss()
+
+# num_epochs = 150
+
+# # Train the Conformer model
+# for epoch in range(num_epochs):
+#     optimizer.zero_grad()
+#     output = conformer_model(input_data)
+#     loss = loss_fn(output, target)
+#     loss.backward()
+#     optimizer.step()
+
+# # Save the trained weights
+# torch.save(conformer_model.state_dict(), "conformer_model.pth")
+# conformer_weights = torch.load("conformer_model.pth")
+# squeezeformer_model = Squeezeformer()
+# squeezeformer_model.load_state_dict(conformer_weights)
+
+
+# optimizer = torch.optim.Adam(squeezeformer_model.parameters(), lr=1e-4)
+# for epoch in range(num_epochs):
+#     optimizer.zero_grad()
+#     output = squeezeformer_model(input_data)
+#     loss = loss_fn(output, target)
+#     loss.backward()
+#     optimizer.step()
+
+# torch.save(squeezeformer_model.state_dict(), "squeezeformer_model.pth")
+
+
