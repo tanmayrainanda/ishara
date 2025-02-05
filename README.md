@@ -1,67 +1,75 @@
-# ishara
+---
+license: apache-2.0
+---
 
-## Overview
+## Ishara: ASL Fingerspelling Recognition
 
-This project implements a deep learning model for American Sign Language (ASL) fingerspelling recognition as part of the Google ASLFR Competition. The model uses a hybrid architecture combining Squeezeformer and Conformer blocks with Conv1D layers to achieve accurate fingerspelling detection from hand landmark data.
+Ishara is a deep learning model designed for accurate recognition of American Sign Language (ASL) fingerspelling. It is based on a hybrid architecture that combines **Squeezeformer** and **Conformer** blocks with **Conv1D layers** for efficient feature extraction from hand, face, and pose landmark data.
+
+This model is a submission to the Google ASLFR Competition and achieves robust performance on character-level prediction tasks.
+
+---
+
+## Model Description
+
+Ishara processes sequences of normalized hand, face, and pose landmarks to predict fingerspelled words at the character level. The architecture is designed to handle temporal variability and missing data using a combination of:
+
+- **Squeezeformer blocks**: For efficient sequence modeling.
+- **Conformer blocks**: For enhanced feature extraction.
+- **Conv1D layers**: For initial temporal feature extraction.
+
+The output predictions are character-level sequences optimized using **Connectionist Temporal Classification (CTC)** loss.
+
+---
 
 ## Dataset
 
-The dataset is provided by Google's ASLFR (American Sign Language Fingerspelling Recognition) Competition and consists of:
+The model was trained and evaluated on the dataset provided by the [Google ASLFR Competition](https://www.kaggle.com/competitions/asl-fingerspelling), which consists of:
 
-- Hand landmark positions (x, y, z coordinates)
-- Face landmark positions
-- Pose landmarks
-- Corresponding text labels (fingerspelled words)
+- **Hand landmarks**: 21 points each for left and right hands.
+- **Face landmarks**: 40 key points.
+- **Pose landmarks**: 10 key points.
+- **Labels**: Text sequences representing fingerspelled words.
 
-### Data Format
+---
 
-- Input: Sequences of landmark coordinates
-- Output: Character sequences representing fingerspelled words
-- Features include:
-  - 21 right hand landmarks
-  - 21 left hand landmarks
-  - 40 face landmarks
-  - 10 pose landmarks
+## Usage
 
-## Model Architecture
+### Inference with TFLite
 
-The model implements a hybrid architecture with the following key components:
-
-1. **Input Processing**
-
-   - Landmark normalization
-   - Temporal padding and resizing
-   - Masking for missing frames
-
-2. **Core Architecture**
-
-   - Configurable number of Conv1D blocks
-   - Squeezeformer blocks for sequence processing
-   - Conformer blocks for enhanced feature extraction
-   - Efficient Channel Attention (ECA)
-   - Gated Linear Units (GLU)
-   - Swish activation functions
-
-3. **Output Layer**
-   - Dense layers with CTC loss
-   - Character-level prediction
-
-## Requirements
-
-```
-tensorflow>=2.6.0
-tensorflow-addons
-numpy
-pandas
-tqdm
-matplotlib
-python-Levenshtein
-```
-
-### Training
+The model is available in TensorFlow Lite format for real-time inference. To use the model:
 
 ```python
-# Configure model parameters
+import tensorflow as tf
+
+# Load the TFLite model
+interpreter = tf.lite.Interpreter("model.tflite")
+interpreter.allocate_tensors()
+
+# Define input-output
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Input a sequence of landmarks
+input_data = ... # Preprocessed input sequence
+interpreter.set_tensor(input_details[0]['index'], input_data)
+interpreter.invoke()
+
+# Get the prediction
+output_data = interpreter.get_tensor(output_details[0]['index'])
+print("Predicted Sequence:", output_data)
+```
+
+---
+
+### Training Workflow
+
+You can replicate the training process using TensorFlow. The training loop is as follows:
+
+```python
+from model import get_model
+
+# Define the model
 model = get_model(
     dim=256,
     num_conv_squeeze_blocks=2,
@@ -80,66 +88,65 @@ history = model.fit(
 )
 ```
 
-### Inference
-
-```python
-# Load model and make predictions
-interpreter = tf.lite.Interpreter("model.tflite")
-prediction_fn = interpreter.get_signature_runner(REQUIRED_SIGNATURE)
-output = prediction_fn(inputs=frame)
-```
+---
 
 ## Model Evaluation
 
-The model is evaluated using:
+The model's performance is evaluated using:
 
-- Levenshtein distance for character-level accuracy
-- Normalized character error rate
-- Real-time inference speed
+- **Levenshtein Distance**: Measures character-level accuracy.
+- **Normalized Character Error Rate (CER)**: Quantifies the model's robustness.
+- **Real-Time Inference Speed**: Assessed on 1080p video inputs.
 
-## TFLite Conversion
-
-The model can be converted to TFLite format for deployment:
-
-```python
-converter = tf.lite.TFLiteConverter.from_keras_model(tflitemodel_base)
-tflite_model = converter.convert()
-```
+---
 
 ## Results
 
-- Validation accuracy: [To be filled]
-- Average inference time: [To be filled]
-- Model size: [To be filled]
+- **Normalised Levenshtein Distance**: [0.728]
+- **Inference Speed**: [200ms]
+- **Model Size**: [17.9 Mb]
+
+---
+
+## Deployment
+
+The model is optimized for deployment in real-time systems using TensorFlow Lite. This makes it suitable for integration into mobile and embedded systems for ASL recognition tasks.
+
+---
 
 ## License
 
- Copyright 2024 Niharika Gupta, Tanay Srinivasa, Tanmay Nanda, Zoya Ghoshal
+This model is released under the [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0).
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+---
 
 ## Acknowledgments
 
-- Google ASLFR Competition for providing the dataset
-- TensorFlow team for the framework
-- Original Squeezeformer and Conformer paper authors
+- **Google ASLFR Competition**: For providing the dataset.
+- **TensorFlow Team**: For the deep learning framework.
+- **Paper Authors**: For inspiring the architecture.
+  - [Squeezeformer](https://arxiv.org/abs/2206.00888)
+  - [Conformer](https://arxiv.org/abs/2005.08100)
 
-## References
+---
 
-1. Squeezeformer: https://arxiv.org/abs/2206.00888
-2. Conformer:  https://arxiv.org/abs/2005.08100
-3. Google ASLFR Competition: https://www.kaggle.com/competitions/asl-fingerspelling
+## Citation
+
+If you use this model, please consider citing:
+
+```
+@misc{ishara_asl,
+  title={Ishara: ASL Fingerspelling Recognition},
+  author={Niharika Gupta, Tanay Srinivasa, Tanmay Nanda, Zoya Ghoshal},
+  year={2025},
+  howpublished={\url{https://huggingface.co/ishara-asl}}
+}
+```
+
+---
 
 ## Contact
 
-Tanmay Nanda - tanmaynanda360@gmail.com
+For questions or collaboration, feel free to reach out:
+
+- **Tanmay Nanda**: tanmaynanda360@gmail.com
