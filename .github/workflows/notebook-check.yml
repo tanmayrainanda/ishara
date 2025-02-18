@@ -1,0 +1,118 @@
+name: Notebook Syntax Check
+
+on:
+  push:
+    paths:
+      - "**.ipynb"
+  pull_request:
+    paths:
+      - "**.ipynb"
+  workflow_dispatch:
+
+jobs:
+  lint-notebooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nbconvert jupyter-core black jupyter-black
+
+      - name: Check notebook syntax
+        run: |
+          python -c "
+          import json
+          import sys
+          import glob
+          import ast
+
+          def check_python_syntax(code):
+              try:
+                  ast.parse(code)
+                  return True
+              except SyntaxError as e:
+                  return False
+
+          def check_notebook(path):
+              with open(path, 'r') as f:
+                  try:
+                      nb = json.load(f)
+                  except json.JSONDecodeError:
+                      print(f'Error: {path} is not a valid JSON file')
+                      return False
+              
+              has_errors = False
+              for cell_num, cell in enumerate(nb.get('cells', []), 1):
+                  if cell.get('cell_type') == 'code':
+                      source = ''.join(cell.get('source', ''))
+                      if source.strip():  # Only check non-empty cells
+                          if not check_python_syntax(source):
+                              print(f'Syntax error in {path}, cell {cell_num}')
+                              has_errors = True
+              
+              return not has_errors
+
+          exit_code = 0
+          for notebook in glob.glob('**/*.ipynb', recursive=True):
+              print(f'Checking {notebook}...')
+              if not check_notebook(notebook):
+                  exit_code = 1
+
+          sys.exit(exit_code)
+          "
+
+      - name: Check notebook structure
+        run: |
+          python -c "
+          import json
+          import sys
+          import glob
+
+          def check_metadata(path):
+              with open(path, 'r') as f:
+                  nb = json.load(f)
+              
+              # Check for kernel_info metadata
+              metadata = nb.get('metadata', {})
+              if 'kernelspec' not in metadata:
+                  print(f'Warning: {path} missing kernel specification')
+                  return False
+              
+              return True
+
+          warnings = False
+          for notebook in glob.glob('**/*.ipynb', recursive=True):
+              if not check_metadata(notebook):
+                  warnings = True
+
+          sys.exit(0)  # Don't fail on metadata warnings
+          "
+
+      - name: Check for oversized notebooks
+        run: |
+          python -c "
+          import os
+          import sys
+          import glob
+
+          MAX_SIZE = 100 * 1024 * 1024  # 100MB
+
+          warnings = False
+          for notebook in glob.glob('**/*.ipynb', recursive=True):
+              size = os.path.getsize(notebook)
+              if size > MAX_SIZE:
+                  print(f'Warning: {notebook} is too large ({size/1024/1024:.2f}MB)')
+                  warnings = True
+
+          sys.exit(0)  # Don't fail on size warnings
+          "
